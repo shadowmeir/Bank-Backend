@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
+using Microsoft.AspNetCore.HttpOverrides;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -27,14 +28,16 @@ builder.Services
 // =====================
 // Addition: allow frontend dev server to call the API from a browser.
 // IMPORTANT: keep origins tight (do NOT AllowAnyOrigin with credentials).
+var allowedOrigins =
+    builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
+    ?? new[] { "http://localhost:5173" };
+
 builder.Services.AddCors(o =>
 {
-    o.AddPolicy("frontend-dev", p => p
-        .WithOrigins("http://localhost:5173"  // Vite dev
-        )
+    o.AddPolicy("frontend", p => p
+        .WithOrigins(allowedOrigins)
         .AllowAnyHeader()
-        .AllowAnyMethod()
-    );
+        .AllowAnyMethod());
 });
 
 // ======
@@ -130,6 +133,18 @@ builder.Services.AddSwaggerGen(c =>
 
 var app = builder.Build();
 
+var fwd = new ForwardedHeadersOptions
+{
+    ForwardedHeaders =
+        ForwardedHeaders.XForwardedFor |
+        ForwardedHeaders.XForwardedProto |
+        ForwardedHeaders.XForwardedHost
+};
+
+fwd.KnownNetworks.Clear();
+fwd.KnownProxies.Clear();
+app.UseForwardedHeaders(fwd);
+
 // Auto-migrate on startup (dev-friendly; for prod usually run migrations separately)
 using (var scope = app.Services.CreateScope())
 {
@@ -153,7 +168,7 @@ if (!app.Environment.IsDevelopment())
 
 
 // CORS must run before auth/authorization for browser calls
-app.UseCors("frontend-dev");
+app.UseCors("frontend");
 
 app.UseAuthentication();
 app.UseAuthorization();

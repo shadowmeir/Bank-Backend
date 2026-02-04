@@ -1,0 +1,63 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: bank
+      POSTGRES_USER: bank
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - bank_pg:/var/lib/postgresql/data
+    networks: [appnet]
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ASPNETCORE_URLS: http://0.0.0.0:8080
+
+      ConnectionStrings__Default: Host=db;Port=5432;Database=bank;Username=bank;Password=${POSTGRES_PASSWORD}
+
+      Api__PublicBaseUrl: https://api.neobankers.org
+      Frontend__BaseUrl: https://www.neobankers.org
+
+      Cors__AllowedOrigins__0: https://www.neobankers.org
+      Cors__AllowedOrigins__1: https://neobankers.org
+      Cors__AllowedOrigins__2: https://app.neobankers.org
+
+      Jwt__Issuer: Bank.Api
+      Jwt__Audience: Bank.Client
+      Jwt__Key: ${JWT_KEY}
+
+      Smtp__Host: ${SMTP_HOST}
+      Smtp__Port: ${SMTP_PORT}
+      Smtp__UseStartTls: "true"
+      Smtp__Username: ${SMTP_USER}
+      Smtp__Password: ${SMTP_PASS}
+      Smtp__FromEmail: ${SMTP_FROM}
+      Smtp__FromName: ${SMTP_FROM_NAME}
+
+    depends_on: [db]
+    networks: [appnet]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api]
+    networks: [appnet]
+    restart: unless-stopped
+
+networks:
+  appnet:
+
+volumes:
+  bank_pg:
+  caddy_data:
+  caddy_config:

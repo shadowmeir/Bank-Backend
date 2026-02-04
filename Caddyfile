@@ -1,0 +1,3 @@
+api.neobankers.org {
+  reverse_proxy api:8080
+}
