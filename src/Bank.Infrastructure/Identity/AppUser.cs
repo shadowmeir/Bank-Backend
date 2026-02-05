@@ -10,4 +10,7 @@ public class AppUser : IdentityUser
     // PhoneNumber already exists on IdentityUser, so it is NOT re-added it here.
 
     public string? Address { get; set; }
+    
+    //NEW: This is the status check for a user: new users are in pending status until confirmation email activated
+    public ClientStatus Status { get; set; } = ClientStatus.Pending;
 }

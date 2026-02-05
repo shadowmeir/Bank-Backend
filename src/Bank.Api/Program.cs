@@ -11,6 +11,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Microsoft.AspNetCore.HttpOverrides;
+using Bank.Api.Middleware;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -39,6 +40,12 @@ builder.Services.AddCors(o =>
         .AllowAnyHeader()
         .AllowAnyMethod());
 });
+
+
+// ======
+// Middleware - check if user is Active, if not - use email confirmation (smtp + token)
+// ======
+builder.Services.AddScoped<ActiveUserMiddleware>();
 
 // ======
 // DB
@@ -171,6 +178,7 @@ if (!app.Environment.IsDevelopment())
 app.UseCors("frontend");
 
 app.UseAuthentication();
+app.UseMiddleware<ActiveUserMiddleware>();
 app.UseAuthorization();
 
 app.MapControllers();

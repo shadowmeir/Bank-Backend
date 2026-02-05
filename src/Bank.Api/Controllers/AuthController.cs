@@ -46,8 +46,18 @@ public class AuthController : ControllerBase
 
     public record AuthResponse(string AccessToken);
 
+    // Frontend expects this shape when verification is required
+    public record RegisterResponse(bool RequiresEmailConfirmation, string Email);
+
     public record ResendConfirmationRequest(string Email);
 
+    public record ForgotPasswordRequest(string Email);
+
+    public record ResetPasswordRequest(string UserId, string Token, string NewPassword);
+
+    // -------------------------
+    // REGISTER: Pending + send email + NO JWT
+    // -------------------------
     [HttpPost("register")]
     public async Task<IActionResult> Register([FromBody] RegisterRequest req)
     {
@@ -65,8 +75,10 @@ public class AuthController : ControllerBase
             UserName = email,
             Email = email,
             EmailConfirmed = false,
+            Status = ClientStatus.Pending,
+
             FirstName = string.IsNullOrWhiteSpace(req.FirstName) ? null : req.FirstName.Trim(),
-            LastName = string.IsNullOrWhiteSpace(req.LastName) ? null : req.LastName.Trim(),
+            LastName  = string.IsNullOrWhiteSpace(req.LastName)  ? null : req.LastName.Trim(),
             PhoneNumber = string.IsNullOrWhiteSpace(req.PhoneNumber) ? null : req.PhoneNumber.Trim()
         };
 
@@ -77,7 +89,6 @@ public class AuthController : ControllerBase
             return Problem(statusCode: 400, title: "IdentityError", detail: msg);
         }
 
-        // Send email confirmation (don’t block the user with opaque 500s)
         try
         {
             await SendConfirmationEmailAsync(user);
@@ -86,17 +97,17 @@ public class AuthController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed sending confirmation email to {Email}", user.Email);
-
-            // User already exists now; return an actionable error
             var detail = IsDev() ? ex.Message : "Failed to send verification email. Please try again.";
             return Problem(statusCode: 500, title: "EmailSendFailed", detail: detail);
         }
 
-        // You can choose NOT to issue a token until verified, but keeping your current behavior:
-        var token = _jwt.CreateAccessToken(user.Id, user.Email, user.UserName);
-        return Ok(new AuthResponse(token));
+        // IMPORTANT: do not issue JWT here
+        return Ok(new RegisterResponse(true, user.Email!));
     }
 
+    // -------------------------
+    // LOGIN: only Active + EmailConfirmed
+    // -------------------------
     [HttpPost("login")]
     public async Task<IActionResult> Login([FromBody] LoginRequest req)
     {
@@ -109,7 +120,17 @@ public class AuthController : ControllerBase
         if (user is null)
             return Problem(statusCode: 401, title: "Unauthorized", detail: "Invalid credentials.");
 
-        if (!user.EmailConfirmed)
+        if (user.Status == ClientStatus.Blocked)
+            return Problem(statusCode: 403, title: "AccountBlocked", detail: "Your account is blocked. Please contact support.");
+
+        // Self-heal: confirmed email but still Pending => make Active
+        if (user.EmailConfirmed && user.Status == ClientStatus.Pending)
+        {
+            user.Status = ClientStatus.Active;
+            await _users.UpdateAsync(user);
+        }
+
+        if (!user.EmailConfirmed || user.Status != ClientStatus.Active)
             return Problem(statusCode: 403, title: "EmailNotConfirmed", detail: "Please confirm your email before logging in.");
 
         var ok = await _signIn.CheckPasswordSignInAsync(user, req.Password, lockoutOnFailure: true);
@@ -120,8 +141,55 @@ public class AuthController : ControllerBase
         return Ok(new AuthResponse(token));
     }
 
+    // -------------------------
+    // CONFIRM EMAIL (SPA): frontend calls this
+    // GET /auth/confirm-email?userId=...&token=...
+    // -------------------------
+    [HttpGet("confirm-email")]
+    public async Task<IActionResult> ConfirmEmailSpa([FromQuery] string userId, [FromQuery] string token)
+    {
+        var user = await _users.FindByIdAsync(userId);
+        if (user is null)
+            return Problem(statusCode: 400, title: "InvalidLink", detail: "Invalid verification link.");
+
+        try
+        {
+            // If already confirmed, just ensure status is Active
+            if (user.EmailConfirmed)
+            {
+                if (user.Status != ClientStatus.Active)
+                {
+                    user.Status = ClientStatus.Active;
+                    await _users.UpdateAsync(user);
+                }
+
+                return Ok(new { ok = true });
+            }
+
+            var decodedBytes = WebEncoders.Base64UrlDecode(token);
+            var rawToken = Encoding.UTF8.GetString(decodedBytes);
+
+            var result = await _users.ConfirmEmailAsync(user, rawToken);
+            if (!result.Succeeded)
+                return Problem(statusCode: 400, title: "BadToken", detail: "Verification token is invalid or expired.");
+
+            user.Status = ClientStatus.Active;
+            await _users.UpdateAsync(user);
+
+            return Ok(new { ok = true });
+        }
+        catch
+        {
+            return Problem(statusCode: 400, title: "BadToken", detail: "Verification token is invalid or expired.");
+        }
+    }
+
+    // -------------------------
+    // LEGACY CONFIRM (old emails): redirects to frontend login
+    // GET /auth/confirm?userId=...&token=...
+    // -------------------------
     [HttpGet("confirm")]
-    public async Task<IActionResult> ConfirmEmail([FromQuery] string userId, [FromQuery] string token)
+    public async Task<IActionResult> ConfirmEmailLegacy([FromQuery] string userId, [FromQuery] string token)
     {
         var user = await _users.FindByIdAsync(userId);
         if (user is null)
@@ -133,10 +201,13 @@ public class AuthController : ControllerBase
             var rawToken = Encoding.UTF8.GetString(decodedBytes);
 
             var result = await _users.ConfirmEmailAsync(user, rawToken);
-            if (result.Succeeded)
-                return Redirect($"{GetFrontendBaseUrl()}/login?verified=1");
+            if (!result.Succeeded)
+                return Redirect($"{GetFrontendBaseUrl()}/login?verified=0&reason=badtoken");
 
-            return Redirect($"{GetFrontendBaseUrl()}/login?verified=0&reason=badtoken");
+            user.Status = ClientStatus.Active;
+            await _users.UpdateAsync(user);
+
+            return Redirect($"{GetFrontendBaseUrl()}/login?verified=1");
         }
         catch
         {
@@ -144,6 +215,9 @@ public class AuthController : ControllerBase
         }
     }
 
+    // -------------------------
+    // RESEND CONFIRMATION
+    // -------------------------
     [HttpPost("resend-confirmation")]
     public async Task<IActionResult> ResendConfirmation([FromBody] ResendConfirmationRequest req)
     {
@@ -154,7 +228,7 @@ public class AuthController : ControllerBase
         var user = await _users.FindByEmailAsync(email);
 
         // Don’t reveal whether the user exists
-        if (user is null || user.EmailConfirmed)
+        if (user is null || user.EmailConfirmed || user.Status == ClientStatus.Blocked)
             return Ok(new { ok = true });
 
         try
@@ -166,20 +240,107 @@ public class AuthController : ControllerBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed resending confirmation email to {Email}", user.Email);
-
             var detail = IsDev() ? ex.Message : "Failed to send verification email. Please try again.";
             return Problem(statusCode: 500, title: "EmailSendFailed", detail: detail);
         }
     }
 
+    // -------------------------
+    // FORGOT PASSWORD
+    // -------------------------
+    [HttpPost("forgot-password")]
+    public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequest req)
+    {
+        // Always OK to prevent account enumeration
+        if (string.IsNullOrWhiteSpace(req.Email))
+            return Ok(new { ok = true });
+
+        var email = req.Email.Trim().ToLowerInvariant();
+        var user = await _users.FindByEmailAsync(email);
+
+        if (user is null || !user.EmailConfirmed || user.Status == ClientStatus.Blocked)
+            return Ok(new { ok = true });
+
+        try
+        {
+            var token = await _users.GeneratePasswordResetTokenAsync(user);
+            var encoded = WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(token));
+
+            var resetUrl = QueryHelpers.AddQueryString(
+                $"{GetFrontendBaseUrl()}/reset-password",
+                new Dictionary<string, string?>
+                {
+                    ["userId"] = user.Id,
+                    ["token"] = encoded
+                }!);
+
+            var subject = "Reset your password";
+            var html = $@"
+<div style='font-family:Arial,sans-serif;line-height:1.6'>
+  <h2>Password reset</h2>
+  <p>Click to reset your password:</p>
+  <p><a href='{resetUrl}'>Reset password</a></p>
+  <p style='color:#888'>If you didn’t request this, ignore this email.</p>
+</div>";
+
+            await _email.SendAsync(user.Email!, subject, html);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed sending reset email to {Email}", user.Email);
+            // Still return OK
+        }
+
+        return Ok(new { ok = true });
+    }
+
+    // -------------------------
+    // RESET PASSWORD
+    // -------------------------
+    [HttpPost("reset-password")]
+    public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.UserId) ||
+            string.IsNullOrWhiteSpace(req.Token) ||
+            string.IsNullOrWhiteSpace(req.NewPassword))
+        {
+            return Problem(statusCode: 400, title: "Validation", detail: "Missing reset parameters.");
+        }
+
+        var user = await _users.FindByIdAsync(req.UserId);
+        if (user is null)
+            return Problem(statusCode: 400, title: "InvalidLink", detail: "Invalid reset link.");
+
+        try
+        {
+            var decodedBytes = WebEncoders.Base64UrlDecode(req.Token);
+            var rawToken = Encoding.UTF8.GetString(decodedBytes);
+
+            var result = await _users.ResetPasswordAsync(user, rawToken, req.NewPassword);
+            if (!result.Succeeded)
+            {
+                var msg = string.Join("; ", result.Errors.Select(e => $"{e.Code}: {e.Description}"));
+                return Problem(statusCode: 400, title: "ResetFailed", detail: msg);
+            }
+
+            return Ok(new { ok = true });
+        }
+        catch
+        {
+            return Problem(statusCode: 400, title: "BadToken", detail: "Reset token is invalid or expired.");
+        }
+    }
+
+    // -------------------------
+    // Email helper: send FRONTEND verify link
+    // -------------------------
     private async Task SendConfirmationEmailAsync(AppUser user)
     {
-        // Generate token -> encode URL-safe
         var token = await _users.GenerateEmailConfirmationTokenAsync(user);
         var encodedToken = WebEncoders.Base64UrlEncode(Encoding.UTF8.GetBytes(token));
 
-        var confirmUrl = QueryHelpers.AddQueryString(
-            $"{GetApiBaseUrl()}/auth/confirm",
+        var verifyUrl = QueryHelpers.AddQueryString(
+            $"{GetFrontendBaseUrl()}/verify-email",
             new Dictionary<string, string?>
             {
                 ["userId"] = user.Id,
@@ -187,27 +348,15 @@ public class AuthController : ControllerBase
             }!);
 
         var subject = "Confirm your email";
-
-        // Keep it simple; Brevo accepts HTML just fine
         var html = $@"
 <div style='font-family:Arial,sans-serif;line-height:1.6'>
   <h2>Confirm your email</h2>
   <p>Click to verify your email address:</p>
-  <p><a href='{confirmUrl}'>Verify email</a></p>
+  <p><a href='{verifyUrl}'>Verify email</a></p>
   <p style='color:#888'>If you didn't sign up, ignore this message.</p>
 </div>";
 
         await _email.SendAsync(user.Email!, subject, html);
-    }
-
-    private string GetApiBaseUrl()
-    {
-        // Prefer explicit config for production (reverse proxies)
-        var cfg = _config["Api:PublicBaseUrl"];
-        if (!string.IsNullOrWhiteSpace(cfg)) return cfg.TrimEnd('/');
-
-        // Dev fallback
-        return $"{Request.Scheme}://{Request.Host}";
     }
 
     private string GetFrontendBaseUrl()
