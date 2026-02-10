@@ -12,13 +12,13 @@ using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using Microsoft.AspNetCore.HttpOverrides;
 using Bank.Api.Middleware;
+using Bank.Api.Chatbot;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // =====================
 // 1) Controllers + JSON
 // =====================
-// Addition: JsonStringEnumConverter so LedgerEntryType shows as "TransferOut" instead of 2.
 builder.Services
     .AddControllers()
     .AddJsonOptions(o =>
@@ -27,8 +27,6 @@ builder.Services
 // =====================
 // 2) CORS (frontend dev)
 // =====================
-// Addition: allow frontend dev server to call the API from a browser.
-// IMPORTANT: keep origins tight (do NOT AllowAnyOrigin with credentials).
 var allowedOrigins =
     builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
     ?? new[] { "http://localhost:5173" };
@@ -38,12 +36,15 @@ builder.Services.AddCors(o =>
     o.AddPolicy("frontend", p => p
         .WithOrigins(allowedOrigins)
         .AllowAnyHeader()
-        .AllowAnyMethod());
+        .AllowAnyMethod()
+        // CHATBOT: SignalR uses negotiate + websockets; some setups need credentials.
+        // If you do NOT use cookies, you can omit this. Keep it if you hit CORS issues.
+        // .AllowCredentials()
+    );
 });
 
-
 // ======
-// Middleware - check if user is Active, if not - use email confirmation (smtp + token)
+// Middleware - check if user is Active
 // ======
 builder.Services.AddScoped<ActiveUserMiddleware>();
 
@@ -54,12 +55,17 @@ builder.Services.AddDbContext<BankDbContext>(opt =>
     opt.UseNpgsql(builder.Configuration.GetConnectionString("Default")));
 
 // =========================
+// CHATBOT: SignalR + Router
+// =========================
+builder.Services.AddSignalR();
+builder.Services.AddScoped<IChatbotRouter, ChatbotRouter>();
+
+// =========================
 // Identity (Client = AppUser)
 // =========================
 builder.Services.AddIdentityCore<AppUser>(opt =>
 {
     opt.User.RequireUniqueEmail = true;
-    // Deploy grade: requires unique email on registration
     opt.SignIn.RequireConfirmedEmail = true;
 })
 .AddEntityFrameworkStores<BankDbContext>()
@@ -69,7 +75,6 @@ builder.Services.AddIdentityCore<AppUser>(opt =>
 // =========
 // JWT Auth
 // =========
-// NOTE: In production, Jwt:Key must be a strong secret from env/user-secrets/vault, NOT hardcoded.
 var jwtKey = builder.Configuration["Jwt:Key"] ?? "DEV_ONLY_CHANGE_ME_CHANGE_ME_CHANGE_ME_32CHARS";
 var issuer = builder.Configuration["Jwt:Issuer"] ?? "Bank.Api";
 var audience = builder.Configuration["Jwt:Audience"] ?? "Bank.Client";
@@ -91,6 +96,25 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateLifetime = true,
             ClockSkew = TimeSpan.FromSeconds(30)
         };
+
+        // =========================
+        // CHATBOT: JWT for SignalR
+        // =========================
+        // Browsers cannot set Authorization header for WebSocket upgrade easily,
+        // so SignalR commonly sends JWT via query string: ?access_token=...
+        opt.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                var path = context.HttpContext.Request.Path;
+
+                if (!string.IsNullOrEmpty(accessToken) && path.StartsWithSegments("/hubs/chat"))
+                    context.Token = accessToken;
+
+                return Task.CompletedTask;
+            }
+        };
     });
 
 builder.Services.AddAuthorization();
@@ -107,7 +131,6 @@ Console.WriteLine($"SMTP Host: {smtp["Host"]}, Port: {smtp["Port"]}, From: {smtp
 builder.Services.AddScoped<IAccountRepository, AccountRepository>();
 builder.Services.AddScoped<ILedgerRepository, LedgerRepository>();
 builder.Services.AddScoped<IBankUnitOfWork, EfUnitOfWork>();
-
 builder.Services.AddScoped<IJwtTokenService, JwtTokenService>();
 
 // ===================
@@ -152,7 +175,7 @@ fwd.KnownNetworks.Clear();
 fwd.KnownProxies.Clear();
 app.UseForwardedHeaders(fwd);
 
-// Auto-migrate on startup (dev-friendly; for prod usually run migrations separately)
+// Auto-migrate on startup
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<BankDbContext>();
@@ -166,20 +189,23 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI();
 }
 
-//app.UseHttpsRedirection(); (use in Production)
-
+// Use in Production
 if (!app.Environment.IsDevelopment())
 {
     app.UseHttpsRedirection();
 }
 
-
-// CORS must run before auth/authorization for browser calls
+// CORS must run before auth
 app.UseCors("frontend");
 
 app.UseAuthentication();
 app.UseMiddleware<ActiveUserMiddleware>();
 app.UseAuthorization();
+
+// =========================
+// CHATBOT: Hub endpoint
+// =========================
+app.MapHub<ChatHub>("/hubs/chat");
 
 app.MapControllers();
 
