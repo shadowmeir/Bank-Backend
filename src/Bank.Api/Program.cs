@@ -38,8 +38,7 @@ builder.Services.AddCors(o =>
         .AllowAnyHeader()
         .AllowAnyMethod()
         // CHATBOT: SignalR uses negotiate + websockets; some setups need credentials.
-        // If you do NOT use cookies, you can omit this. Keep it if you hit CORS issues.
-        // .AllowCredentials()
+        .AllowCredentials()
     );
 });
 
