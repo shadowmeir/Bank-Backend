@@ -56,8 +56,10 @@ builder.Services.AddDbContext<BankDbContext>(opt =>
 // =========================
 // CHATBOT: SignalR + Router
 // =========================
-builder.Services.AddSignalR();
+builder.Services.AddSignalR(o => o.EnableDetailedErrors = true);
 builder.Services.AddScoped<IChatbotRouter, ChatbotRouter>();
+
+builder.Logging.AddConsole();
 
 // =========================
 // Identity (Client = AppUser)
