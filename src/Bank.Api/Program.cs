@@ -206,7 +206,7 @@ app.UseAuthorization();
 // =========================
 // CHATBOT: Hub endpoint
 // =========================
-app.MapHub<ChatHub>("/hubs/chat");
+app.MapHub<Bank.Api.Chatbot.ChatHub>("/hubs/chat");
 
 app.MapControllers();
 
