@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using System.Text.Json;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
@@ -18,9 +19,15 @@ public sealed class ChatHub : Hub
         _logger = logger;
     }
 
-    // Frontend calls this: connection.invoke("SendToBot", message, optionalAccountId)
-    public async Task SendToBot(string message, string? accountId = null)
+    // Frontend can call either:
+    // 1) connection.invoke("SendToBot", "balance", optionalAccountId)
+    // 2) connection.invoke("SendToBot", { text: "balance", accountId: "..." })
+    public async Task SendToBot(object? message, string? accountId = null)
     {
+        var normalized = NormalizeIncoming(message, accountId);
+        message = normalized.Message;
+        accountId = normalized.AccountId;
+
         // Identify the caller via JWT claim (or SignalR fallback)
         var clientId =
             Context.User?.FindFirstValue(ClaimTypes.NameIdentifier) ??
@@ -30,8 +37,8 @@ public sealed class ChatHub : Hub
         var ct = Context.ConnectionAborted;
 
         // Basic input hygiene
-        message ??= "";
-        if (message.Length > 2000)
+        var text = message?.ToString() ?? "";
+        if (text.Length > 2000)
         {
             await SafeSendAsync(
                 new ChatBotMessage(
@@ -48,13 +55,13 @@ public sealed class ChatHub : Hub
             clientId,
             Context.ConnectionId,
             accountId ?? "(null)",
-            message.Length,
-            message.Length <= 200 ? message : message[..200] + "…");
+            text.Length,
+            text.Length <= 200 ? text : text[..200] + "…");
 
         try
         {
             // Route the message => compute reply (may query DB)
-            var reply = await _router.RouteAsync(clientId, message, accountId, ct);
+            var reply = await _router.RouteAsync(clientId, text, accountId, ct);
 
             // Return reply only to the caller
             await SafeSendAsync(reply, ct);
@@ -92,7 +99,11 @@ public sealed class ChatHub : Hub
         // In case the client disconnected, SendAsync may throw; we prefer not to crash the hub.
         try
         {
-            return Clients.Caller.SendAsync("ReceiveBotMessage", msg, ct);
+            // Keep current frontend contract: ReceiveBotMessage(string).
+            // If/when UI needs metadata, it can subscribe to ReceiveBotEnvelope.
+            return Task.WhenAll(
+                Clients.Caller.SendAsync("ReceiveBotMessage", msg.Text, ct),
+                Clients.Caller.SendAsync("ReceiveBotEnvelope", msg, ct));
         }
         catch (Exception ex)
         {
@@ -100,4 +111,36 @@ public sealed class ChatHub : Hub
             return Task.CompletedTask;
         }
     }
+
+    private static (string Message, string? AccountId) NormalizeIncoming(object? incoming, string? fallbackAccountId)
+    {
+        if (incoming is null)
+            return ("", fallbackAccountId);
+
+        if (incoming is string s)
+            return (s, fallbackAccountId);
+
+        if (incoming is ChatClientMessage m)
+            return (m.Text ?? "", string.IsNullOrWhiteSpace(m.AccountId) ? fallbackAccountId : m.AccountId);
+
+        if (incoming is JsonElement json)
+        {
+            if (json.ValueKind == JsonValueKind.String)
+                return (json.GetString() ?? "", fallbackAccountId);
+
+            if (json.ValueKind == JsonValueKind.Object)
+            {
+                var text = TryGetString(json, "text") ?? TryGetString(json, "Text") ?? "";
+                var accountId = TryGetString(json, "accountId") ?? TryGetString(json, "AccountId");
+                return (text, string.IsNullOrWhiteSpace(accountId) ? fallbackAccountId : accountId);
+            }
+        }
+
+        return (incoming.ToString() ?? "", fallbackAccountId);
+    }
+
+    private static string? TryGetString(JsonElement obj, string name)
+        => obj.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.String
+            ? p.GetString()
+            : null;
 }
