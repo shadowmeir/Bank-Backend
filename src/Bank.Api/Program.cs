@@ -25,16 +25,50 @@ builder.Services
         o.JsonSerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 
 // =====================
-// 2) CORS (frontend dev)
+// 2) CORS
 // =====================
-var allowedOrigins =
-    builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
-    ?? new[] { "http://localhost:5173" };
+static string[] NormalizeOrigins(IEnumerable<string?> origins)
+{
+    return origins
+        .Where(o => !string.IsNullOrWhiteSpace(o))
+        .Select(o => o!.Trim().TrimEnd('/'))
+        .Where(o =>
+        {
+            if (o.Contains("*"))
+                return o.StartsWith("http://*.") || o.StartsWith("https://*."); // e.g. https://*.neobankers.org
+
+            return Uri.TryCreate(o, UriKind.Absolute, out var uri)
+                && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
+        })
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToArray();
+}
+
+var configuredOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
+    ?? Array.Empty<string>();
+
+var knownFrontendOrigins = new[]
+{
+    builder.Configuration["App:FrontendBaseUrl"],
+    builder.Configuration["Frontend:BaseUrl"],
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+    "https://neobankers.org",
+    "https://www.neobankers.org",
+    "https://app.neobankers.org",
+    "https://*.neobankers.org"
+};
+
+var allowedOrigins = NormalizeOrigins(configuredOrigins.Concat(knownFrontendOrigins));
+Console.WriteLine($"CORS Allowed Origins: {string.Join(", ", allowedOrigins)}");
 
 builder.Services.AddCors(o =>
 {
     o.AddPolicy("frontend", p => p
         .WithOrigins(allowedOrigins)
+        .SetIsOriginAllowedToAllowWildcardSubdomains()
         .AllowAnyHeader()
         .AllowAnyMethod()
         // CHATBOT: SignalR uses negotiate + websockets; some setups need credentials.

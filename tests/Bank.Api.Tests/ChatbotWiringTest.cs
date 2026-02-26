@@ -18,6 +18,7 @@ public sealed class ChatbotProgramWiringTests
 
         // SignalR (optional here, but fine)
         services.AddSignalR();
+        services.AddLogging();
 
         // ✅ Register a minimal BankDbContext so DI can construct ChatbotRouter.
         // No provider configured -> OK for "can it be constructed" tests.
