@@ -19,12 +19,18 @@ public sealed class ChatbotRouter : IChatbotRouter
     private readonly BankDbContext _db;
     private readonly IAccountRepository _accounts;
     private readonly ILedgerRepository _ledger;
+    private readonly IChatIntentResolver _intentResolver;
 
-    public ChatbotRouter(BankDbContext db, IAccountRepository accounts, ILedgerRepository ledger)
+    public ChatbotRouter(
+        BankDbContext db,
+        IAccountRepository accounts,
+        ILedgerRepository ledger,
+        IChatIntentResolver intentResolver)
     {
         _db = db;
         _accounts = accounts;
         _ledger = ledger;
+        _intentResolver = intentResolver;
     }
 
     public async Task<ChatBotMessage> RouteAsync(string clientId, string rawText, string? accountId, CancellationToken ct)
@@ -40,18 +46,22 @@ public sealed class ChatbotRouter : IChatbotRouter
         if (text.StartsWith('/'))
             return await RouteSlashAsync(clientId, text, accountId, ct);
 
-        // 2) Minimal synonym mapping (still deterministic, not AI).
-        if (text is "help" or "?" or "commands" || text.Contains("what can you do"))
-            return Help();
+        // 2) Deterministic synonyms (cheap + predictable).
+        if (TryResolveDeterministicCommand(text, out var deterministicCmd))
+            return await RouteSlashAsync(clientId, deterministicCmd, accountId, ct);
 
-        if (text is "accounts" or "list accounts" || text.Contains("list my accounts"))
-            return await AccountsAsync(clientId, ct);
-
-        if (text is "balance" || text.Contains("my balance") || text.Contains("current balance"))
-            return await BalanceAsync(clientId, accountId, ct);
-
-        if (text.Contains("recent") || text.Contains("transactions"))
-            return await RecentAsync(clientId, accountId, limit: 10, ct);
+        // 3) LLM intent resolution => map free text to an existing slash-command.
+        // If anything fails here, keep old behavior and return "unknown".
+        try
+        {
+            var llmCmd = await _intentResolver.ResolveSlashCommandAsync(rawText, accountId, ct);
+            if (!string.IsNullOrWhiteSpace(llmCmd))
+                return await RouteSlashAsync(clientId, llmCmd, accountId, ct);
+        }
+        catch
+        {
+            // Intent resolver failures should never break chatbot responses.
+        }
 
         // Default fallback.
         return Bot(BotIntent.Unknown, "Sorry — I didn’t understand. Type /help.");
@@ -324,5 +334,36 @@ public sealed class ChatbotRouter : IChatbotRouter
                 return n;
         }
         return fallback;
+    }
+
+    private static bool TryResolveDeterministicCommand(string text, out string command)
+    {
+        command = "";
+
+        if (text is "help" or "?" or "commands" || text.Contains("what can you do"))
+        {
+            command = BotCommands.Help;
+            return true;
+        }
+
+        if (text is "accounts" or "list accounts" || text.Contains("list my accounts"))
+        {
+            command = BotCommands.Accounts;
+            return true;
+        }
+
+        if (text is "balance" || text.Contains("my balance") || text.Contains("current balance"))
+        {
+            command = BotCommands.Balance;
+            return true;
+        }
+
+        if (text.Contains("recent") || text.Contains("transactions"))
+        {
+            command = BotCommands.Recent;
+            return true;
+        }
+
+        return false;
     }
 }

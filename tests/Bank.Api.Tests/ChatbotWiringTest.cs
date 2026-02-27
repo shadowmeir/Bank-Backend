@@ -32,6 +32,7 @@ public sealed class ChatbotProgramWiringTests
         services.AddScoped<IAccountRepository>(_ => Mock.Of<IAccountRepository>());
         services.AddScoped<ILedgerRepository>(_ => Mock.Of<ILedgerRepository>());
         services.AddScoped<IBankUnitOfWork>(_ => Mock.Of<IBankUnitOfWork>());
+        services.AddScoped<IChatIntentResolver>(_ => Mock.Of<IChatIntentResolver>());
 
         // Router + Hub (match Program.cs)
         services.AddScoped<IChatbotRouter, ChatbotRouter>();

@@ -13,6 +13,7 @@ using Microsoft.OpenApi.Models;
 using Microsoft.AspNetCore.HttpOverrides;
 using Bank.Api.Middleware;
 using Bank.Api.Chatbot;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -91,6 +92,17 @@ builder.Services.AddDbContext<BankDbContext>(opt =>
 // CHATBOT: SignalR + Router
 // =========================
 builder.Services.AddSignalR(o => o.EnableDetailedErrors = true);
+builder.Services.Configure<ChatbotLlmOptions>(builder.Configuration.GetSection(ChatbotLlmOptions.SectionName));
+builder.Services.AddSingleton<NoopChatIntentResolver>();
+builder.Services.AddHttpClient<OpenAiChatIntentResolver>();
+builder.Services.AddScoped<IChatIntentResolver>(sp =>
+{
+    var options = sp.GetRequiredService<IOptions<ChatbotLlmOptions>>().Value;
+    if (!options.Enabled || string.IsNullOrWhiteSpace(options.ApiKey))
+        return sp.GetRequiredService<NoopChatIntentResolver>();
+
+    return sp.GetRequiredService<OpenAiChatIntentResolver>();
+});
 builder.Services.AddScoped<IChatbotRouter, ChatbotRouter>();
 
 builder.Logging.AddConsole();
